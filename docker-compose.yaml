@@ -1,0 +1,103 @@
+# Сервис сокращения ссылок: frontend + backend + PostgreSQL
+# за nginx-proxy с автоматическими сертификатами Let's Encrypt (acme-companion).
+#
+# Запуск:  cp .env.example .env   # указать DOMAIN и POSTGRES_PASSWORD
+#          docker compose up -d --build
+#
+# Сети:
+#   proxy   — nginx-proxy ↔ frontend (единственный путь снаружи внутрь)
+#   backend — frontend ↔ backend ↔ db, внутренняя (internal: true), без выхода наружу
+
+name: shortener
+
+services:
+  nginx-proxy:
+    image: nginxproxy/nginx-proxy:1.6
+    container_name: shortener-proxy
+    restart: unless-stopped
+    ports:
+      - "80:80"     # HTTP: проверка ACME HTTP-01 и редирект на HTTPS
+      - "443:443"   # HTTPS
+    volumes:
+      - /var/run/docker.sock:/tmp/docker.sock:ro   # отслеживание контейнеров
+      - certs:/etc/nginx/certs                     # сертификаты (пишет acme-companion)
+      - html:/usr/share/nginx/html                 # файлы ACME-challenge
+    networks:
+      - proxy
+
+  acme-companion:
+    image: nginxproxy/acme-companion:2.5
+    container_name: shortener-acme
+    restart: unless-stopped
+    depends_on:
+      - nginx-proxy
+    environment:
+      - NGINX_PROXY_CONTAINER=shortener-proxy
+      - DEFAULT_EMAIL=${LETSENCRYPT_EMAIL:-}       # необязательно
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - certs:/etc/nginx/certs
+      - html:/usr/share/nginx/html
+      - acme:/etc/acme.sh
+    networks:
+      - proxy
+
+  frontend:
+    build: ./frontend
+    image: shortener-frontend:1.0
+    restart: unless-stopped
+    expose:
+      - "80"
+    environment:
+      - VIRTUAL_HOST=${DOMAIN:?укажите DOMAIN в .env}
+      - LETSENCRYPT_HOST=${DOMAIN}
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - proxy
+      - backend
+
+  backend:
+    build: ./backend
+    image: shortener-backend:1.0
+    restart: unless-stopped
+    expose:
+      - "8000"
+    environment:
+      - DATABASE_URL=postgresql://shortener:${POSTGRES_PASSWORD:?укажите POSTGRES_PASSWORD в .env}@db:5432/shortener
+      - PUBLIC_URL=https://${DOMAIN}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - backend
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_DB=shortener
+      - POSTGRES_USER=shortener
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro   # схема БД
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shortener -d shortener"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - backend
+
+volumes:
+  certs:
+  html:
+  acme:
+  pgdata:
+
+networks:
+  proxy:
+  backend:
+    internal: true
